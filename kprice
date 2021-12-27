@@ -1,0 +1,410 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+'''
+# kprice
+
+Plot cryptocurrency price data on the command-line. This is designed for 
+terminal emulators that support the "legacy computing characters" unicode block.
+'''
+################################################################################
+import os, sys
+import requests     # For calling Kraken's REST API
+import pandas as pd # For parsing the JSON responses
+import numpy  as np # For easier manipulation of arrays
+
+
+################################################################################
+# Configuration
+interval     = 60 # minutes
+PLOTHEIGHT   = 14
+PLOTMINWIDTH = 40
+prices_in    = 'USD'
+
+# Prices to show if no command-line arguments provided
+showcharts_default = ['BTC','ETH']
+
+
+################################################################################
+# Terminal output styling
+# https://en.wikipedia.org/wiki/ANSI_escape_code
+
+# ANSI codes for 256-color mode foreground/background
+fg = lambda i: '\x1b[38;5;%dm'%i
+bg = lambda i: '\x1b[48;5;%dm'%i
+
+# Resets all color/format registers
+rs_all    = '\x1b[0m'
+
+# Resets the background color
+rs_bg     = '\x1b[49m'
+
+# Background and foreground colors for logging messages
+logbg      = bg(90)
+logcolor1  = fg(209)
+logcolor2  = fg(214)
+
+# Colors for startup logo (medium green)
+logocolor  = bg(233) + fg(120)
+
+# Fill colors for background, low-high range, and below the low price
+bgcolor    = bg(233) # Plot background color
+linecolor  = 176     # Color to shade between high, low price range
+fill_color = 90      # Color to shade blow the "low" price in plot
+
+# Colors of major/minor lines above/below plot
+minor_line_color        = fg(235) # Dark  gray
+major_line_color        = fg(240) # Light gray
+minor_line_color_filled = fg(58)  # Dark  olive; Looks gray against magenta
+major_line_color_filled = fg(100) # Light olive; Looks gray against magenta
+labelcolor              = bg(233)+fg(214) # Default (reset) background and amber foreground
+
+
+################################################################################
+# Colored logging messages, optionally saving some messages to disk
+columns,rows = os.get_terminal_size(0)
+__log_label_width__ = 14                # Columns for log category prefix
+__logfile_name__    = 'kprice_logs.txt' # File to use, if saving log messages to disk
+def LOG(msg,
+    newline    = False,      # Whether to terminate message with a newline
+    colored    = True,       # Whether to apply ANSI color codes
+    cr         = True,       # Whether to prefix message with carriage return
+    file       = sys.stdout, # File to print to (usually sys.stdout)
+    prefix     = 'Kraken',   # Prefix to categorize this message
+    logcolumns = columns,    # Terminal width (columns)
+    save       = False):     # save: whether to save a copy of this message to __logfile_name__
+    # Start the message with a right-justified "category label"
+    output = ''
+    if cr     : output += '\r'
+    if colored: output += logbg + logcolor1
+    output             += (prefix+': ').rjust(__log_label_width__)
+    # Then add the logging message 
+    if colored: output += rs_all + logbg + logcolor2
+    output             += str(msg).ljust(logcolumns-__log_label_width__)
+    if colored: output += rs_all
+    # Show on screen
+    print(output,file=file,flush=True,end='\n' if newline else '')
+    # Optionally, save a copy
+    if save:
+        with open(__logfile_name__,'a') as f:
+            output = str(datetime.now()) + ':' +\
+                (prefix+': ').rjust(__log_label_width__) +\
+                str(msg).ljust(logcolumns-__log_label_width__) +\
+                '\n'
+            f.write(output)
+
+
+################################################################################
+# Show logo
+logo='''\n  🬭🬹█████🬺🬱    🬻▌  🬵█🬄 🬻🬲🬹🬝🬄🬞🬹🬝🬎🬎█🬱  🬻▌  🬵█🬄 🬞🬹█🬎🬬🬺🬱  🬻🬺█🬎█🬺🬏
+ 🬻█████████🬺🬏  █▌🬞🬻🬝🬀  █🬝🬀  🬉🬆  🬭🬷█  █▌🬞🬻🬝🬀  🬻🬕   🬁█🬓 █🬕   █▌
+▐█🬝🬎██🬎🬬█🬝🬎█🬺  █🬺🬝█🬱   █▌   🬵█🬎🬎🬆🬨█  █🬺🬝█🬱   █🬝🬎🬎🬎🬎🬎🬄 █▌   █▌
+▐█▌ ██ ▐█▌ ██  █🬕 🬁🬬🬺🬏 █▌   █🬲  🬭🬻█🬏 █🬕 🬁🬬🬺🬏 🬬🬺🬏 🬞🬵█🬄 █▌   █▌
+🬉🬎🬀 🬎🬆 🬉🬎🬀 🬎🬆  🬊🬄   🬊🬎 🬊🬄   🬁🬎🬎🬎🬆🬀🬊🬎 🬊🬄   🬊🬎  🬂🬎🬎🬎🬆🬀  🬊🬄   🬎🬀'''
+print(logocolor+'\n'.join([l.ljust(columns) for l in logo.split('\n')])+rs_all)
+
+
+################################################################################
+# Kraken API calling subroutines
+
+def unpack_json(response):
+    # Check for errors or return result
+    if response['error']:
+        raise ValueError('Server returned error code:'+str(response['error']))
+    return response['result']
+
+# URL to access Kraken's public API
+api_url = "https://api.kraken.com"
+def public_call(command, **kwargs):
+    # Try to call a function in Kraken's public REST API
+    try:
+        resp = requests.post(api_url+'/0/public/'+command, data=kwargs)
+    except:
+        LOG('Error connecting to server',prefix='ERROR!')
+        raise
+    return unpack_json(resp.json())
+
+# Private API keys for your Kraken account go here. This script doesn't use the
+# private API at the moment, but you could extend this script to e.g. query 
+# balances or submit orders. 
+api_key = 'YOUR_PRIVATE_KEY_HERE'
+api_sec = 'YOUR_SECRET_KEY_HERE'
+def private_call(command,**data):
+    # Try to call a function in Kraken's private REST API
+    data['nonce'] = str(int(1000*time.time()))
+    try:
+        uri      = '/0/private/'+command
+        postdata = urllib.parse.urlencode(data)
+        encoded  = (data['nonce'] + postdata).encode()
+        message  = uri.encode() + hashlib.sha256(encoded).digest()
+        mac      = hmac.new(base64.b64decode(api_sec), message, hashlib.sha512)
+        headers  = {'API-Key' : api_key,
+                    'API-Sign': base64.b64encode(mac.digest()).decode()}
+        resp = requests.post(api_url+uri, headers=headers, data=data)
+    except:
+        LOG('Error connecting to server',prefix='ERROR!')
+        raise
+    return unpack_json(resp.json())
+
+################################################################################
+# Wrangle input
+showcharts = sys.argv[1:] if len(sys.argv)>1 else showcharts_default
+aliases = {
+    'BTC':{'bitcoin'},
+    'ETC':{'eth','etherium'},
+    # add more aliases here if you like (:
+}    
+alias_map = {vi:k for (k,v) in aliases.items() for vi in v}
+showcharts = [s.upper()          for s in showcharts]
+showcharts = [alias_map.get(s,s) for s in showcharts]
+
+
+################################################################################
+# Get price history
+symbols = [*showcharts]
+symbols = sorted(symbols)
+prices  = {}
+for sym in set(symbols)|set(showcharts): 
+    LOG('Retrieving %s price history'%sym)
+    result      = [*public_call('OHLC',pair=sym+prices_in,interval=str(interval)).values()][0]
+    cols        = 'time open high low close vwap volume count'.split()
+    prices[sym] = pd.DataFrame(result,columns=cols)
+
+################################################################################
+# Codes to identify background, foreground, and character layers of canvas
+CHLAYER = 0
+BGLAYER = 1
+FGLAYER = 2
+
+################################################################################
+# Plot subroutine; The plotting code is just cobbled together. To show a band
+# between the low and high price, it first draws a plot of the high price (
+# filled below), then draws a plot of the low price (also filled below, and 
+# with horizontal lines added back to the filled area in a different color). 
+def fill_below(
+        signal,                 # Signal to plot (series of integers)
+        canvas,                 # Numpy string array acts as a canvas 
+        fgc    = fg(linecolor), # Foreground color of plot
+        bgc    = bgcolor,       # Background color of plot
+        infill = None,          # Character to print in filled region
+        major  = None):         # Character to print on major tick lines
+
+    # Use the solid "tombstone" character as the default fill.
+    if infill is None: infill = ('█', bgc, fgc)
+
+    # Plot each column of the signal
+    for i in range(len(signal)-1):
+
+        # The teletext characters allow for three different heights within each row
+        a ,b  = signal[i:i+2]
+        ba,bb = a//3 ,b//3
+        ta,tb = a %3 ,b %3
+        
+        # Fill regions below the plot
+        canvas[:min(ba,bb),i,:] = infill
+        if major:
+            canvas[:min(ba,bb):4,i,:] = major
+
+        # Fill in the "lines"
+        if bb>ba and tb==0: bb,tb = bb-1,3
+        if bb<ba and ta==0: ba,ta = ba-1,3
+        if ba==bb:
+            # Move within current text line
+            index = ta*4+tb
+            if index:
+                canvas[min(ba,bb),i,:] =\
+                    (' 🭈🭊◢🬽🬭🭆🭄🬿🭑🬹🭂◣🭏🭍█'[index], bgc, fgc)
+        else:
+            # Go up or down text lines, respectively
+            if bb>ba:
+                start, middle, end = '🭅🭃🭁','▐',' 🭇🭉🭋'
+            else:
+                start, middle, end = '🭐🭎🭌','▌',' 🬼🬾🭀'
+                bb,ba,tb,ta = ba,bb,ta,tb
+            if tb:
+                canvas[bb,i]  = (end[tb]  ,bgc,fgc)
+            canvas[ba,i]      = (start[ta],bgc,fgc)
+            canvas[ba+1:bb,i] = (middle   ,bgc,fgc)
+    return canvas
+
+################################################################################
+# Prepare chart
+def priceplot(prices,MAXROWS=24,MAXCOLS=None,showplot=True,interval=60):
+
+    # Get terminal size; Adjust plot height to fit if needed
+    columns, rows = os.get_terminal_size(0)
+    NROWS, NCOLS  = rows-4, columns
+    if not MAXROWS is None: NROWS = min(MAXROWS, NROWS)
+    if not MAXCOLS is None: NCOLS = min(MAXCOLS, NCOLS)
+    
+    # Get low and high of each interval
+    h = np.float64(prices.high.values)
+    l = np.float64(prices.low.values)
+    
+    # Guess label size
+    fmt        = '%0.2f' if np.min(l)<=10 else '%d'
+    labelwidth = max(len(fmt%np.min(l)),len(fmt%np.max(h)))+1
+    plotwidth  = NCOLS - labelwidth 
+    
+    # Plot on log-scale
+    h = (h)[-plotwidth-1:]
+    l = (l)[-plotwidth-1:]
+    
+    # Get y axis range
+    ymin   = np.min(l)
+    ymax   = np.max(h)
+    yrange = ymax-ymin
+    if not ymin<ymax or np.any(l>h):
+        LOG('Error: minimum price is not smaller than maximum; Is something wrong with the price data?')
+        LOG('Exiting')
+        sys.exit(-1) 
+    NLEVELS = NROWS*3+1
+    
+    # Quantize signals
+    qh = np.int32((NLEVELS-1)*(h-ymin)/yrange)
+    ql = np.int32((NLEVELS-1)*(l-ymin)/yrange)
+    assert np.all(ql<=qh)
+    assert np.min(ql)==0
+    assert np.max(qh)<=NLEVELS-1
+    
+    # Trim things: ensure line width always >0
+    ql = np.minimum(ql, np.maximum(0,qh-1))
+    
+    # Repair collisions
+    for ic in range(100):
+    
+        # Blocks required to draw upper curve
+        qh_mins   = np.minimum(qh[1:],qh[:-1])
+        qh_blocks = qh_mins//3
+        qh_levels = qh_mins%3
+    
+        # Blocks required to draw lower curve
+        ql_maxs   = np.maximum(ql[1:],ql[:-1])
+        ql_blocks = ql_maxs//3
+        ql_levels = ql_maxs%3
+        ql_blocks[ql_levels==0] -= 1
+        ql_levels[ql_levels==0]  = 3
+    
+        # The following columns contain a collision
+        collisions = np.where(ql_blocks >= qh_blocks)[0]
+        if len(collisions)<=0: break
+    
+        # Alternate adjusting upper, lower curves, until collisions resolves
+        if ic%2:
+            qh_whichmin = np.argmin([qh[:-1],qh[1:]],axis=0)[collisions]
+            qh[collisions + qh_whichmin] += 1
+            qh = np.minimum(NLEVELS-1,qh)
+        else:
+            ql_whichmax = np.argmax([ql[:-1],ql[1:]],axis=0)[collisions]
+            ql[collisions + ql_whichmax] -= 1
+            ql = np.maximum(0,ql)
+
+    # Achieve faithful y tick labels
+    line_offset    = 4
+    line_character = '─'#"▁🭻🭺🭹🭸🭷🭶▔"[line_offset]
+    range_per_step = yrange / NLEVELS
+    line_height    = range_per_step*4
+    divisions      = np.linspace(0,line_height,9)
+    centers        = (divisions[1:]+divisions[:-1])/2
+    tickoffset     = centers[line_offset]
+
+    # Generate y tick labels
+    yticks = np.linspace(ymin,ymax,NROWS+1)[:-1] + tickoffset
+    labels = [labelcolor+(fmt%(i)).rjust(labelwidth) for i in yticks]
+
+    # Initialize canvas; 3 dimensions are: characters, background code, foreground code
+    canvas = np.empty([NROWS, plotwidth, 3], dtype="U16")
+
+    # Draw background lines
+    canvas[:,:,:]         = (line_character, bgcolor, minor_line_color)
+    canvas[::4,:,FGLAYER] = major_line_color
+
+    # Fill color below the high price limit
+    fill_below(qh, canvas)
+
+    # Shade graph below low price limit, mimicing the background horizontal lines
+    fill_below(ql, canvas, 
+        fgc    = fg(fill_color),
+        bgc    = bg(linecolor), 
+        infill = (line_character,bg(fill_color),minor_line_color_filled),
+        major  = (line_character,bg(fill_color),major_line_color_filled))
+
+    # Combine characters and color codes
+    lines = []
+    for r in range(NROWS):
+        ch,bc,fc = canvas[r,0,:]
+        line = bc+fc+ch
+        pb,pf = bc,fc
+        for c in range(1,plotwidth):
+            ch,bc,fc = canvas[r,c,:]
+            line += (bc if bc!=pb else '') + (fc if fc!=pf else '') + ch
+            pb,pf = bc,fc
+        lines.append(line)
+
+    # Merge canvas into strings for each line
+    plot = '\n'.join([r+l for l,r in zip(labels,lines)][::-1])
+
+    # Prepare x axis and x axis tick artwork
+    xlabelroom = 3
+    nxblocks = int(np.ceil(NCOLS/6))
+    xaxis    = ''.join(('──────',)*xlabelroom)+''.join(('─────┬',)*(nxblocks-xlabelroom))
+    xaxis    = xaxis[len(xaxis)-plotwidth:-1] + '╮' + ' '*labelwidth
+
+    # Prepare x axis label and x tick labels
+    xlabel = "Hours ago:"
+    def trimmedstr(i):
+        s = str(i)
+        s = s[:-2] if s[-2:]=='.0' else s
+        return s.rjust(6)
+    
+    xticks = [trimmedstr(i) if j>=xlabelroom else ' '*6 for j,i in enumerate((interval*6/60)*np.arange(nxblocks)[::-1])]
+    xticks = ''.join(xticks)
+    xticks = xticks[len(xticks)-NCOLS+labelwidth:]
+    xticks = labelcolor + (xlabel + xticks[len(xlabel):]).ljust(NCOLS)
+    
+    plot   = bgcolor    + plot   + '\n'\
+           + labelcolor + xaxis  + '\n'\
+           + xticks     + '\n'
+ 
+    if showplot:
+        print(plot,flush=True)
+     
+    return plot
+
+
+################################################################################
+# Concatenate plots and print to screen
+nsyms = len(showcharts)
+ncols = 1
+nrows = nsyms
+while columns//(ncols+1)>=PLOTMINWIDTH and ncols<nsyms:
+    ncols +=1
+    nrows = int(np.ceil(nsyms/ncols))
+colwidths = np.diff(np.int32(np.round(np.linspace(0,columns+1,ncols+1))))
+for r in range(nrows):
+    plots = []
+    for c,cw in enumerate(colwidths):
+        i = r*ncols + c
+        if i<nsyms:
+            sym   = showcharts[i]
+            plot  = priceplot(prices[sym],MAXROWS=PLOTHEIGHT,MAXCOLS=cw-1,showplot=False,interval=interval)
+            tt     = sym+' $%0.2f'%np.float64(prices[sym].close.values[-1])
+            title = labelcolor+'╭┤'+'\x1B[7m '+tt+' \x1B[27m'+'├'+'─'*(cw-len(tt)-7)+'╮'
+            plots += [[title,]+[*plot.split('\n')]]
+    nlines = max([len(p) for p in plots])
+    hcat = []
+    for il in range(nlines):
+        l = [p[il] if il<len(p) else ' '*(colwidths[ip]-1) for ip,p in enumerate(plots)]
+        hcat += [' '.join(l)]
+    print('\r'+'\n'.join(hcat))
+
+print(rs_all)
+
+
+
+
+
+
+
+
+
+
